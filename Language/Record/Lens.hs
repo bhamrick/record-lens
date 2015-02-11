@@ -10,7 +10,9 @@
 module Language.Record.Lens where
 
 import Control.Monad
+import Data.List
 import Data.Maybe
+import Data.Traversable
 import GHC.TypeLits
 import Language.Haskell.TH
 
@@ -54,27 +56,33 @@ mkRecordLensClause con field = do
         ))
         []
 
-mkRecordInstancesForCon :: Type -> Con -> Q [Dec]
-mkRecordInstancesForCon ty con = case con of
-    RecC conN recs -> fmap catMaybes . forM recs $ \(recN, _, recTy) ->
-        case nameBase recN of
-            '_':lensNameStr -> do
+-- TODO: Support type-changing updates.
+-- Requires solving for a substitution dictionary as the record type can be a combination of the type variables
+-- and other fields in the record type can prevent the ability to change types.
+-- TODO: Generate traversals gracefully
+-- TODO: Lenses for multiple constructors with the same record
+mkRecordInstancesForCon :: (String -> Maybe String) -> Name -> [TyVarBndr] -> Con -> Q [Dec]
+mkRecordInstancesForCon nameRule tyCon tyBndrs con = case con of
+    RecC conN recs -> fmap catMaybes . for recs $ \(recN, _, recTy) ->
+        case nameRule (nameBase recN) of
+            Just lensNameStr -> do
                 let lensName = mkName lensNameStr
                 clause <- mkRecordLensClause conN recN
                 t <- newName "t"
                 b <- newName "b"
-                return . Just $ InstanceD [EqualP ty (VarT t), EqualP recTy (VarT b)]
+                let ty = appliedType tyCon tyBndrs
+                return . Just $ InstanceD []
                     (foldl AppT (ConT ''Record)
                         [ (LitT (StrTyLit lensNameStr))
                         , (ConT ''Functor)
                         , ty
-                        , (VarT t)
+                        , ty
                         , recTy
-                        , (VarT b)
+                        , recTy
                         ]
                     )
                     [FunD 'recordLens [clause]]
-            _ -> return Nothing
+            Nothing -> return Nothing
     _ -> return []
 
 bndrName :: TyVarBndr -> Name
@@ -84,8 +92,15 @@ bndrName (KindedTV s _) = s
 appliedType :: Name -> [TyVarBndr] -> Type
 appliedType con = foldl AppT (ConT con) . map (VarT . bndrName)
 
-recordLensAlias :: String -> [Dec]
-recordLensAlias recN = [signature, definition]
+fullyAppliedTyCon :: Name -> [TyVarBndr] -> Q Type
+fullyAppliedTyCon con = fmap (foldl AppT (ConT con)) . traverse (fmap VarT . newName . nameBase . bndrName)
+
+recordLensAlias :: String -> Q [Dec]
+recordLensAlias recN = do 
+    mn <- lookupValueName recN
+    case mn of
+        Nothing -> return [signature, definition]
+        Just _ -> return []
     where
     lensName = mkName recN
     signature = 
@@ -114,11 +129,35 @@ recordLensAlias recN = [signature, definition]
     definition = FunD lensName [Clause [] (NormalB aliasExp) []]
     aliasExp = AppE (VarE 'recordLens) (SigE (ConE 'RecordName) (AppT (ConT ''RecordName) (LitT (StrTyLit recN))))
 
-mkRecords :: Name -> Q [Dec]
-mkRecords tyN = do
+prefixRule :: String -> String -> Maybe String
+prefixRule pre s = if pre `isPrefixOf` s
+    then Just (drop (length pre) s)
+    else Nothing
+
+recordNames :: (String -> Maybe String) -> Con -> [(String, String)]
+recordNames nameRule (RecC _ recs) = recs >>= \(recN, _, _) ->
+    case nameRule (nameBase recN) of
+        Just lensNameStr -> [(lensNameStr, nameBase recN)]
+        Nothing -> []
+recordNames _ _ = []
+
+mkRecordAliases :: (String -> Maybe String) -> [Con] -> Q [Dec]
+mkRecordAliases nameRule = fmap concat . traverse recordLensAlias . fmap fst . (>>= recordNames nameRule)
+
+mkRecords :: String -> Name -> Q [Dec]
+mkRecords prefix tyN = do
     TyConI dec <- reify tyN
     case dec of
-        DataD _ n vs cons _ -> 
-            fmap concat $ mapM (mkRecordInstancesForCon (appliedType n vs)) cons
-        NewtypeD _ n vs con _ -> 
-            mkRecordInstancesForCon (appliedType n vs) con
+        DataD _ n vs cons _ -> do
+            instances <- fmap concat $ traverse (mkRecordInstancesForCon nameRule n vs) cons
+            aliases <- mkRecordAliases nameRule cons
+            return $ instances ++ aliases
+        NewtypeD _ n vs con _ -> do
+            instances <- mkRecordInstancesForCon nameRule n vs con
+            aliases <- mkRecordAliases nameRule [con]
+            return $ instances ++ aliases
+    where
+    nameRule = prefixRule prefix
+
+mkRecords' :: Name -> Q [Dec]
+mkRecords' = mkRecords "_"
