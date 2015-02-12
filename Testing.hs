@@ -4,11 +4,6 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE TemplateHaskell #-}
 
--- These are required for my hack around ambiguous variables
--- Would prefer to remove these requirements.
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE UndecidableInstances #-}
-
 import Language.Record.Lens
 
 data Pair a b = Pair { p_first :: a, p_second :: b }
@@ -19,3 +14,18 @@ data IntPair = IntPair { ip_first :: Int, ip_second :: Int }
 
 $(mkRecords "p_" ''Pair)
 $(mkRecords "ip_" ''IntPair)
+
+data RecMaybe a = RecNothing | RecJust { rm_just :: a }
+    deriving (Eq, Show, Ord)
+
+$(mkRecords "rm_" ''RecMaybe)
+
+data OneOf a b = L { _l :: a } | R { _r :: b }
+    deriving (Eq, Show, Ord)
+
+$(mkRecords "_" ''OneOf)
+
+-- Works fine with function types
+data OldLens s t a b = OldLens { _getter :: s -> a, _setter :: s -> b -> t }
+
+$(mkRecords "_" ''OldLens)

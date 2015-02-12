@@ -9,6 +9,7 @@
 
 module Language.Record.Lens where
 
+import Control.Applicative
 import Control.Monad
 import Data.List
 import Data.Maybe
@@ -35,13 +36,13 @@ data Stupid = Stupid { _stupid :: Int }
 stupid :: Functor f => (Int -> f Int) -> Stupid -> f Stupid
 stupid f x = fmap (\b -> x { _stupid = b}) (f (_stupid x))
 
-mkRecordLensClause :: Name -> Name -> Q Clause
-mkRecordLensClause con field = do
+recordPresentClause :: Name -> Con -> Q Clause
+recordPresentClause field (RecC conN recs) = do
     f <- newName "f"
     x <- newName "x"
     a <- newName "a"
     b <- newName "b"
-    return $ Clause [WildP, VarP f, AsP x (RecP con [(field, VarP a)])]
+    return $ Clause [WildP, VarP f, AsP x (RecP conN [(field, VarP a)])]
         (NormalB (AppE
             (AppE
                 (VarE 'fmap)
@@ -55,35 +56,82 @@ mkRecordLensClause con field = do
             )
         ))
         []
+recordPresentClause _ _ = fail "Records aren't present in non-record fields"
+
+recordAbsentClause :: Con -> Q Clause
+recordAbsentClause (RecC conN recs) = do
+    f <- newName "f"
+    let rec_names = map (\(n, _, _) -> n) recs
+    var_names <- traverse (\_ -> newName "a") recs
+    return $ Clause [WildP, VarP f, RecP conN (zip rec_names (map VarP var_names))]
+        (NormalB
+            (AppE
+                (VarE 'pure)
+                (RecConE conN (zip rec_names (map VarE var_names)))
+            )
+        )
+        []
+recordAbsentClause (NormalC conN params) = do
+    f <- newName "f"
+    var_names <- traverse (\_ -> newName "p") params
+    return $ Clause [WildP, VarP f, ConP conN (map VarP var_names)]
+        (NormalB
+            (AppE
+                (VarE 'pure)
+                (foldl AppE (ConE conN) (map VarE var_names))
+            )
+        )
+        []
+recordAbsentClause _ = fail "Unsuported constructor type"
+
+recordPresent :: Name -> Con -> Bool
+recordPresent recN (RecC conN recs) = any (\(n, _, _) -> n == recN) recs
+recordPresent _ _ = False
+
+recordLensClause :: Name -> Con -> Q Clause
+recordLensClause recN con = if recordPresent recN con
+    then recordPresentClause recN con
+    else recordAbsentClause con
 
 -- TODO: Support type-changing updates.
 -- Requires solving for a substitution dictionary as the record type can be a combination of the type variables
 -- and other fields in the record type can prevent the ability to change types.
--- TODO: Generate traversals gracefully
--- TODO: Lenses for multiple constructors with the same record
-mkRecordInstancesForCon :: (String -> Maybe String) -> Name -> [TyVarBndr] -> Con -> Q [Dec]
-mkRecordInstancesForCon nameRule tyCon tyBndrs con = case con of
-    RecC conN recs -> fmap catMaybes . for recs $ \(recN, _, recTy) ->
-        case nameRule (nameBase recN) of
-            Just lensNameStr -> do
-                let lensName = mkName lensNameStr
-                clause <- mkRecordLensClause conN recN
-                t <- newName "t"
-                b <- newName "b"
-                let ty = appliedType tyCon tyBndrs
-                return . Just $ InstanceD []
-                    (foldl AppT (ConT ''Record)
-                        [ (LitT (StrTyLit lensNameStr))
-                        , (ConT ''Functor)
-                        , ty
-                        , ty
-                        , recTy
-                        , recTy
-                        ]
-                    )
-                    [FunD 'recordLens [clause]]
-            Nothing -> return Nothing
-    _ -> return []
+mkRecordInstance :: Name -> [TyVarBndr] -> String -> Name -> [Con] -> Q [Dec]
+mkRecordInstance tyCon tyBndrs lensNameStr recN cons = do
+    case findRecType recN cons of
+        Nothing -> return []
+        Just recTy -> do
+            let lensName = mkName lensNameStr
+            clauses <- traverse (recordLensClause recN) cons
+            return . return $ InstanceD []
+                (foldl AppT (ConT ''Record)
+                    [ (LitT (StrTyLit lensNameStr))
+                    , fConstraint
+                    , ty
+                    , ty
+                    , recTy
+                    , recTy
+                    ]
+                )
+                [FunD 'recordLens clauses]
+    where
+    ty = appliedType tyCon tyBndrs
+
+    fConstraint = if all (recordPresent recN) cons then ConT ''Functor else ConT ''Applicative
+    
+findRecType :: Name -> [Con] -> Maybe Type
+findRecType _ [] = Nothing
+findRecType recN ((RecC conN recs):rest) =
+    case findRecType' recN recs of
+        Just t -> Just t
+        Nothing -> findRecType recN rest
+findRecType recN (_:rest) = findRecType recN rest
+
+findRecType' :: Name -> [(Name, Strict, Type)] -> Maybe Type
+findRecType' _ [] = Nothing
+findRecType' recN ((n, _, t):rest) = if n == recN
+    then Just t
+    else findRecType' recN rest
 
 bndrName :: TyVarBndr -> Name
 bndrName (PlainTV s) = s
@@ -134,10 +182,10 @@ prefixRule pre s = if pre `isPrefixOf` s
     then Just (drop (length pre) s)
     else Nothing
 
-recordNames :: (String -> Maybe String) -> Con -> [(String, String)]
+recordNames :: (String -> Maybe String) -> Con -> [(String, Name)]
 recordNames nameRule (RecC _ recs) = recs >>= \(recN, _, _) ->
     case nameRule (nameBase recN) of
-        Just lensNameStr -> [(lensNameStr, nameBase recN)]
+        Just lensNameStr -> [(lensNameStr, recN)]
         Nothing -> []
 recordNames _ _ = []
 
@@ -149,11 +197,13 @@ mkRecords prefix tyN = do
     TyConI dec <- reify tyN
     case dec of
         DataD _ n vs cons _ -> do
-            instances <- fmap concat $ traverse (mkRecordInstancesForCon nameRule n vs) cons
+            instances <- fmap concat . for (cons >>= recordNames nameRule) $ \(lensNameStr, recN) ->
+                mkRecordInstance n vs lensNameStr recN cons
             aliases <- mkRecordAliases nameRule cons
             return $ instances ++ aliases
         NewtypeD _ n vs con _ -> do
-            instances <- mkRecordInstancesForCon nameRule n vs con
+            instances <- fmap concat . for (recordNames nameRule con) $ \(lensNameStr, recN) ->
+                mkRecordInstance n vs lensNameStr recN [con]
             aliases <- mkRecordAliases nameRule [con]
             return $ instances ++ aliases
     where
