@@ -11,8 +11,15 @@ module Language.Record.Lens where
 
 import Control.Applicative
 import Control.Monad
+import Control.Monad.State
 import Data.List
+import Data.Foldable (foldMap)
+import Data.Map (Map)
+import qualified Data.Map as Map
 import Data.Maybe
+import Data.Monoid
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Traversable
 import GHC.TypeLits
 import Language.Haskell.TH
@@ -23,18 +30,6 @@ class Record (n :: Symbol) c s t a b | n s -> a, n t -> b, n a t -> s, n b s -> 
 type Record' n c s a = Record n c s s a a
 
 data RecordName (n :: Symbol) = RecordName
-
-instance Record "1" Functor (a, x) (b, x) a b where
-    recordLens _ f (a, x) = fmap (flip (,) x) (f a)
-
-_1 :: (Record "1" c s t a b, c f) => (a -> f b) -> (s -> f t)
-_1 = recordLens (RecordName :: RecordName "1")
-
-data Stupid = Stupid { _stupid :: Int }
-    deriving (Eq, Show, Ord)
-
-stupid :: Functor f => (Int -> f Int) -> Stupid -> f Stupid
-stupid f x = fmap (\b -> x { _stupid = b}) (f (_stupid x))
 
 recordPresentClause :: Name -> Con -> Q Clause
 recordPresentClause field (RecC conN recs) = do
@@ -93,9 +88,6 @@ recordLensClause recN con = if recordPresent recN con
     then recordPresentClause recN con
     else recordAbsentClause con
 
--- TODO: Support type-changing updates.
--- Requires solving for a substitution dictionary as the record type can be a combination of the type variables
--- and other fields in the record type can prevent the ability to change types.
 mkRecordInstance :: Name -> [TyVarBndr] -> String -> Name -> [Con] -> Q [Dec]
 mkRecordInstance tyCon tyBndrs lensNameStr recN cons = do
     case findRecType recN cons of
@@ -103,22 +95,63 @@ mkRecordInstance tyCon tyBndrs lensNameStr recN cons = do
         Just recTy -> do
             let lensName = mkName lensNameStr
             clauses <- traverse (recordLensClause recN) cons
+            inTy <- instanceType tyCon tyBndrs lensNameStr recN cons
             return . return $ InstanceD []
-                (foldl AppT (ConT ''Record)
-                    [ (LitT (StrTyLit lensNameStr))
-                    , fConstraint
-                    , ty
-                    , ty
-                    , recTy
-                    , recTy
-                    ]
-                )
+                inTy
                 [FunD 'recordLens clauses]
     where
     ty = appliedType tyCon tyBndrs
 
     fConstraint = if all (recordPresent recN) cons then ConT ''Functor else ConT ''Applicative
-    
+
+instanceType :: Name -> [TyVarBndr] -> String -> Name -> [Con] -> Q Type
+instanceType tyCon tyBndrs lensNameStr recN cons = do
+    let otherFieldTypes = do
+            con <- cons
+            case con of
+                NormalC _ sts -> map snd sts
+                RecC _ vsts -> do
+                    (r_n, _, r_ty) <- vsts
+                    if recN /= r_n
+                        then [r_ty]
+                        else []
+                InfixC st1 _ st2 -> map snd [st1, st2]
+                ForallC _ _ _ -> fail "forall types not supported"
+        ty = appliedType tyCon tyBndrs
+        Just recTy = findRecType recN cons
+        constantTypeVars = foldMap containedTypeVars otherFieldTypes
+        typeVarMap = Map.fromList . map (\x -> (x, x)) . Set.toList $ constantTypeVars
+        fConstraint = if all (recordPresent recN) cons then ConT ''Functor else ConT ''Applicative
+
+    (ty', recTy') <- flip evalStateT typeVarMap $ (,) <$> buildReplacementType ty <*> buildReplacementType recTy
+    return $ foldl AppT (ConT ''Record)
+        [ (LitT (StrTyLit lensNameStr))
+        , fConstraint
+        , ty
+        , ty'
+        , recTy
+        , recTy'
+        ]
+    where
+    buildReplacementType :: Type -> StateT (Map Name Name) Q Type
+    buildReplacementType (ForallT _ _ _) = lift (fail "forall types not supported")
+    buildReplacementType (AppT ty1 ty2) = AppT <$> buildReplacementType ty1 <*> buildReplacementType ty2
+    buildReplacementType (SigT ty k) = SigT <$> buildReplacementType ty <*> return k
+    buildReplacementType (VarT n) = StateT $ \nameMap ->
+        case Map.lookup n nameMap of
+            Nothing -> do
+                n' <- newName (nameBase n)
+                return (VarT n', Map.insert n n' nameMap)
+            Just n' -> return (VarT n', nameMap)
+    buildReplacementType ty = return ty
+
+containedTypeVars :: Type -> Set Name
+containedTypeVars (ForallT _ _ _) = error "forall types not supported in records"
+containedTypeVars (AppT t1 t2) = containedTypeVars t1 <> containedTypeVars t2
+containedTypeVars (SigT t _) = containedTypeVars t
+containedTypeVars (VarT n) = Set.singleton n
+containedTypeVars _ = Set.empty
+
 findRecType :: Name -> [Con] -> Maybe Type
 findRecType _ [] = Nothing
 findRecType recN ((RecC conN recs):rest) =
@@ -144,14 +177,14 @@ fullyAppliedTyCon :: Name -> [TyVarBndr] -> Q Type
 fullyAppliedTyCon con = fmap (foldl AppT (ConT con)) . traverse (fmap VarT . newName . nameBase . bndrName)
 
 recordLensAlias :: String -> Q [Dec]
-recordLensAlias recN = do 
+recordLensAlias recN = do
     mn <- lookupValueName recN
     case mn of
         Nothing -> return [signature, definition]
         Just _ -> return []
     where
     lensName = mkName recN
-    signature = 
+    signature =
         let c = mkName "c"
             s = mkName "s"
             t = mkName "t"
