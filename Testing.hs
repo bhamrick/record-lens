@@ -29,3 +29,9 @@ $(mkRecords "_" ''OneOf)
 data OldLens s t a b = OldLens { _getter :: s -> a, _setter :: s -> b -> t }
 
 $(mkRecords "_" ''OldLens)
+
+-- Record lenses cannot change phantom types in order to preserve the functional dependencies
+newtype Phantom a b = Phantom { _phant :: b }
+    deriving (Eq, Show, Ord)
+
+$(mkRecords "_" ''Phantom)

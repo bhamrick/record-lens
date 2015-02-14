@@ -120,7 +120,17 @@ instanceType tyCon tyBndrs lensNameStr recN cons = do
         ty = appliedType tyCon tyBndrs
         Just recTy = findRecType recN cons
         constantTypeVars = foldMap containedTypeVars otherFieldTypes
-        typeVarMap = Map.fromList . map (\x -> (x, x)) . Set.toList $ constantTypeVars
+        allFieldTypes = do
+            con <- cons
+            case con of
+                NormalC _ sts -> map snd sts
+                RecC _ vsts -> map (\(_, _, ty) -> ty) vsts
+                InfixC st1 _ st2 -> map snd [st1, st2]
+                ForallC _ _ _ -> fail "forall types not supported"
+        allFieldTypeVars = foldMap containedTypeVars allFieldTypes
+        allTypeVars = map bndrName tyBndrs
+        phantomTypeVars = filter (not . flip Set.member allFieldTypeVars) allTypeVars
+        typeVarMap = Map.fromList . map (\x -> (x, x)) $ Set.toList constantTypeVars ++ phantomTypeVars
         fConstraint = if all (recordPresent recN) cons then ConT ''Functor else ConT ''Applicative
 
     (ty', recTy') <- flip evalStateT typeVarMap $ (,) <$> buildReplacementType ty <*> buildReplacementType recTy
