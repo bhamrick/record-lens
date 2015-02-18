@@ -7,7 +7,11 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE TemplateHaskell #-}
 
-module Language.Record.Lens where
+module Language.Record.Lens 
+    ( mkRecordAliases
+    , mkRecords
+    , mkRecords'
+    ) where
 
 import Control.Applicative
 import Control.Monad
