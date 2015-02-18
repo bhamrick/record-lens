@@ -8,7 +8,10 @@
 {-# LANGUAGE TemplateHaskell #-}
 
 module Language.Record.Lens 
-    ( mkRecordAliases
+    ( Record(..)
+    , Record'
+    , RecordName
+    , mkRecordAliases
     , mkRecords
     , mkRecords'
     ) where
